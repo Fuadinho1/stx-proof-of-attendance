@@ -176,3 +176,110 @@
             ;; Update event counter
             (var-set event-counter event-id)
             (ok event-id))))
+
+
+;; Helper function to check if an event exists
+(define-read-only (event-exists (event-id uint))
+    (is-some (map-get? events event-id)))
+;; Attendance functions
+(define-public (check-in (event-id uint))
+    (let ((event (unwrap! (get-event event-id) ERR-EVENT-NOT-FOUND)))
+        (begin
+            (asserts! (get is-active event) ERR-EVENT-ENDED)          ;; Fixed: correct tuple accessor syntax
+            (asserts! (>= block-height (get start-height event)) ERR-EVENT-NOT-ENDED)  ;; Fixed: correct tuple accessor syntax
+            (asserts! (< block-height (get end-height event)) ERR-EVENT-ENDED)         ;; Fixed: correct tuple accessor syntax
+            (asserts! (is-none (get-attendance-record event-id tx-sender)) ERR-ALREADY-REGISTERED)
+            (map-set event-attendance 
+                {event-id: event-id, attendee: tx-sender}
+                {
+                    check-in-height: block-height,
+                    check-out-height: u0,
+                    duration: u0,
+                    verified: false
+                })
+            (ok true))))
+
+(define-public (check-out (event-id uint))
+    (let ((attendance (unwrap! (get-attendance-record event-id tx-sender) ERR-EVENT-NOT-FOUND))
+          (event (unwrap! (get-event event-id) ERR-EVENT-NOT-FOUND)))
+        (begin
+            (asserts! (get is-active event) ERR-EVENT-ENDED)                         ;; Fixed: correct tuple accessor syntax
+            (asserts! (> block-height (get check-in-height attendance)) ERR-INVALID-DURATION)  ;; Fixed: correct tuple accessor syntax
+            (let ((duration (- block-height (get check-in-height attendance))))      ;; Fixed: correct tuple accessor syntax
+                (map-set event-attendance
+                    {event-id: event-id, attendee: tx-sender}
+                    {
+                        check-in-height: (get check-in-height attendance),           ;; Fixed: correct tuple accessor syntax
+                        check-out-height: block-height,
+                        duration: duration,
+                        verified: false
+                    })
+                (ok duration)))))
+
+;; Additional error codes for verification
+(define-constant ERR-EVENT-NOT-ACTIVE (err u120))
+(define-constant ERR-NO-CHECKIN-RECORD (err u121))
+(define-constant ERR-ALREADY-VERIFIED (err u122))
+(define-constant ERR-INVALID-ATTENDEE (err u123))
+
+;; Helper function to check if attendance can be verified
+(define-read-only (can-verify-attendance (event-id uint) (attendee principal))
+    (let ((attendance (get-attendance-record event-id attendee))
+          (event (get-event event-id)))
+        (and 
+            (is-some attendance)                          ;; Attendance record exists
+            (is-some event)                              ;; Event exists
+            (get is-active (unwrap! event false))        ;; Event is active
+            (> (get check-in-height (unwrap! attendance false)) u0)  ;; Has checked in
+            (not (get verified (unwrap! attendance false)))          ;; Not already verified
+        )))
+
+
+;; Enhanced verification function
+(define-public (verify-attendance (event-id uint) (attendee principal))
+    (let ((attendance (unwrap! (get-attendance-record event-id attendee) ERR-EVENT-NOT-FOUND))
+          (event (unwrap! (get-event event-id) ERR-EVENT-NOT-FOUND)))
+        (begin
+            ;; Verify the caller is authorized
+            (asserts! (is-verifier tx-sender) ERR-NOT-AUTHORIZED)
+
+            ;; Check if event is still active
+            (asserts! (get is-active event) ERR-EVENT-NOT-ACTIVE)
+
+            ;; Verify attendee is a valid principal
+            (asserts! (not (is-eq attendee tx-sender)) ERR-INVALID-ATTENDEE)
+
+            ;; Check if already verified
+            (asserts! (not (get verified attendance)) ERR-ALREADY-VERIFIED)
+
+            ;; Verify check-in record exists and is valid
+            (asserts! (> (get check-in-height attendance) u0) ERR-NO-CHECKIN-RECORD)
+
+            ;; Update attendance record
+            (map-set event-attendance
+                {event-id: event-id, attendee: attendee}
+                (merge attendance {verified: true}))
+
+            ;; Store verification details separately
+            (map-set verification-details
+                {event-id: event-id, attendee: attendee}
+                {
+                    verified-by: tx-sender,
+                    verified-at: block-height
+                })
+            (ok true))))
+
+;; Helper function to get verification details
+(define-read-only (get-verification-details (event-id uint) (attendee principal))
+    (map-get? verification-details {event-id: event-id, attendee: attendee}))
+
+;; Helper function to check verification status with details
+(define-read-only (get-full-verification-status (event-id uint) (attendee principal))
+    (let ((attendance (get-attendance-record event-id attendee))
+          (details (get-verification-details event-id attendee)))
+        {
+            verified: (match attendance
+                        attendance-data (get verified attendance-data)
+                        false),
+            details: details
+        }))
